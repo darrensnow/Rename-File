@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 
-"""Normalize video and folder names based on AV code patterns.
+"""Rename video files into TinyMediaManager-friendly names.
 
-The script scans video files under a root path and derives a normalized code
-from the file name first, then from the parent folder name. It also normalizes
-folder names when the folder name itself contains an AV code.
+The script walks a library root, detects folders that contain video files,
+guesses whether each folder contains a movie or TV episodes, and prints or
+applies the rename plan.
 
-Supported examples:
-  WAAA-338       -> WAAA-338
-  WAAA-338-C     -> WAAA-338-C
-  waaa-338       -> WAAA-338
-  WAAA-338ch     -> WAAA-338-C
-  WAAA-338-UC    -> WAAA-338-C
-  waaa-338ch     -> WAAA-338-C
-  XXXXX@WAAA-338-C -> WAAA-338-C
-  WAAA-338-U     -> WAAA-338
-  MVSD-551-GC    -> MVSD-551
-  MVSD-523-C_X1080X -> MVSD-523-C
+Movie folders:
+  Folder Name (2024)/random-file.mkv -> Folder Name (2024).mkv
+  Folder Name (2024)/cut-1080p.mkv   -> Folder Name (2024) - 1080p.mkv
 
-Run without arguments to open the GUI. Pass a root path to use the CLI.
+TV folders:
+  Show Name/S01E02.mkv               -> Show Name - S01E02.mkv
+  Show Name/02 - Pilot.mkv           -> Show Name - S01E02 - Pilot.mkv
+  Show Name Season 1/EP03.mp4        -> Show Name - S01E03.mp4
+
+By default the script only prints the plan. Add --apply to rename files.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 VIDEO_EXTENSIONS = {
@@ -56,78 +55,117 @@ VIDEO_EXTENSIONS = {
 SKIP_DIR_NAMES = {
     ".git",
     "@eadir",
-    "__pycache__",
+    "extrafanart",
+    "extras",
+    "sample",
+    "samples",
 }
 
-CODE_PATTERN = re.compile(
-    r"(?i)(?<![a-z0-9])"
-    r"(?P<prefix>[a-z]{2,10})"
-    r"\s*[-_ ]?\s*"
-    r"(?P<number>\d{3,5})"
-    r"(?:\s*[-_ ]?\s*(?P<suffix>uc|ch|c|u))?"
-    r"(?![a-z0-9])"
+SEASON_ONLY_PATTERNS = [
+    re.compile(r"(?i)^season[ ._-]*(?P<season>\d{1,2})$"),
+    re.compile(r"(?i)^s(?P<season>\d{1,2})$"),
+    re.compile(r"^第\s*(?P<season>\d{1,2})\s*季$"),
+]
+
+SEASON_HINT_PATTERNS = [
+    re.compile(r"(?i)\bseason[ ._-]*(?P<season>\d{1,2})\b"),
+    re.compile(r"(?i)\bs(?P<season>\d{1,2})\b"),
+    re.compile(r"第\s*(?P<season>\d{1,2})\s*季"),
+]
+
+EPISODE_PATTERNS = [
+    re.compile(r"(?i)\bs(?P<season>\d{1,2})[ ._-]*e(?P<episode>\d{1,3})\b"),
+    re.compile(r"(?i)\b(?P<season>\d{1,2})x(?P<episode>\d{1,3})\b"),
+    re.compile(r"(?i)\bepisode[ ._-]*(?P<episode>\d{1,3})\b"),
+    re.compile(r"(?i)\bep?[ ._-]*(?P<episode>\d{1,3})\b"),
+    re.compile(r"第\s*(?P<episode>\d{1,3})\s*[集话話]"),
+]
+
+LEADING_EPISODE_PATTERN = re.compile(r"^\s*(?P<episode>\d{1,3})(?:\b|[ ._-]+)")
+
+TECHNICAL_TOKEN_PATTERN = re.compile(
+    r"(?i)\b("
+    r"480p|576p|720p|1080p|1440p|2160p|4k|8k|"
+    r"x264|x265|h[\s._-]?26[45]|hevc|av1|"
+    r"aac|ac3|eac3|dts(?:[\s._-]?hd)?|truehd|atmos|flac|fla|"
+    r"web[\s._-]*dl|webrip|web|bluray|bdrip|brrip|remux|dvdrip|"
+    r"hdr(?:10)?|dolby[\s._-]?vision|dv|proper|repack|10bit|8bit|"
+    r"amzn|nf|dsnp|hmax|ddp(?:[\s._-]?\d(?:\.\d)?)?|"
+    r"\d{2,3}fps"
+    r")\b"
 )
+
+EXTRA_PATTERNS = [
+    ("behindthescenes", re.compile(r"(?i)behind[ ._-]*the[ ._-]*scenes")),
+    ("deleted", re.compile(r"(?i)deleted[ ._-]*scenes?")),
+    ("featurette", re.compile(r"(?i)featurette")),
+    ("interview", re.compile(r"(?i)interview")),
+    ("scene", re.compile(r"(?i)scene")),
+    ("short", re.compile(r"(?i)short")),
+    ("trailer", re.compile(r"(?i)trailer")),
+    ("sample", re.compile(r"(?i)sample")),
+    ("extras", re.compile(r"(?i)extra")),
+]
+
+ILLEGAL_CHAR_PATTERN = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
+MULTI_SPACE_PATTERN = re.compile(r"\s+")
+SEPARATOR_EDGE_PATTERN = re.compile(r"^[\s._\-]+|[\s._\-]+$")
+YEAR_PATTERN = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+TITLE_TRAILING_TRIM_PATTERN = re.compile(r"[\s\-._\(\[\)\]]+$")
 
 
 @dataclass(frozen=True)
 class RenamePlan:
-    kind: str
     source: Path
     target: Path
+
+
+@dataclass(frozen=True)
+class EpisodeInfo:
+    season: int
+    episode: int
+    title_hint: str
+
+
+@dataclass(frozen=True)
+class ScanItem:
+    source: Path
+    target: Path
+    mode: str
     status: str
     detail: str
 
 
-@dataclass(frozen=True)
-class ScanResult:
-    root: Path
-    recursive: bool
-    directories: list[Path]
-    video_files: list[Path]
-    file_plans: list[RenamePlan]
-    directory_plans: list[RenamePlan]
-    plans: list[RenamePlan]
-    rename_plans: list[RenamePlan]
-    conflict_plans: list[RenamePlan]
-    file_rename_plans: list[RenamePlan]
-    directory_rename_plans: list[RenamePlan]
-
-
-def is_same_name(source: Path, target: Path) -> bool:
-    return source.parent == target.parent and source.name == target.name
-
-
-def normalize_root(root: Path) -> Path:
-    resolved = root.expanduser().resolve()
-    if not resolved.exists() or not resolved.is_dir():
-        raise FileNotFoundError(f"目录不存在，或不是有效文件夹：{resolved}")
-    return resolved
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="将视频和文件夹名整理为规范的番号格式。"
+        description="Rename media files into TinyMediaManager-friendly names."
     )
     parser.add_argument(
         "root",
         nargs="?",
         type=Path,
-        help="要扫描的根目录；不传则直接打开图形界面。",
+        help="Library root to scan. Omit to open the GUI.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "movie", "tv"),
+        default="auto",
+        help="Rename mode. Default: auto.",
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="实际执行重命名；不带此参数时只预览结果。",
+        help="Apply renames. Without this flag the script only prints a dry-run plan.",
     )
     parser.add_argument(
         "--no-recursive",
         action="store_true",
-        help="只扫描根目录及其一级子目录，不递归深入。",
+        help="Only scan the root folder itself and its direct child folders.",
     )
     parser.add_argument(
         "--gui",
         action="store_true",
-        help="打开图形界面。",
+        help="Open the graphical interface.",
     )
     return parser.parse_args(argv)
 
@@ -136,197 +174,322 @@ def is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
 
 
-def is_skipped_directory(path: Path) -> bool:
-    return any(part.lower() in SKIP_DIR_NAMES for part in path.parts)
+def normalize_whitespace(value: str) -> str:
+    return MULTI_SPACE_PATTERN.sub(" ", value).strip()
 
 
-def iter_video_files(root: Path, recursive: bool) -> list[Path]:
-    if recursive:
-        files: list[Path] = []
-        for candidate in root.rglob("*"):
-            if not candidate.is_file():
-                continue
-            if is_skipped_directory(candidate):
-                continue
-            if is_video_file(candidate):
-                files.append(candidate)
-        return sorted(files, key=lambda path: str(path).lower())
-
-    files = [child for child in root.iterdir() if is_video_file(child)]
-    for child in root.iterdir():
-        if child.is_dir() and child.name.lower() not in SKIP_DIR_NAMES:
-            files.extend(grandchild for grandchild in child.iterdir() if is_video_file(grandchild))
-    return sorted(files, key=lambda path: str(path).lower())
+def normalize_component(value: str) -> str:
+    value = value.replace("(", " (").replace(")", ") ")
+    value = value.replace("_", " ").replace(".", " ")
+    value = ILLEGAL_CHAR_PATTERN.sub(" ", value)
+    value = normalize_whitespace(value)
+    value = re.sub(r"\s*-\s*", " - ", value)
+    value = normalize_whitespace(value)
+    return SEPARATOR_EDGE_PATTERN.sub("", value)
 
 
-def iter_candidate_directories(root: Path, recursive: bool) -> list[Path]:
-    if recursive:
-        directories = [
-            candidate
-            for candidate in root.rglob("*")
-            if candidate.is_dir() and not is_skipped_directory(candidate)
-        ]
-    else:
-        directories = [
-            child for child in root.iterdir() if child.is_dir() and child.name.lower() not in SKIP_DIR_NAMES
-        ]
-
-    return sorted(
-        [directory for directory in directories if extract_code(directory.name)],
-        key=lambda path: str(path).lower(),
-    )
+def simplify_for_match(value: str) -> str:
+    value = value.replace("_", " ").replace(".", " ")
+    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+    return normalize_whitespace(value).lower()
 
 
-def build_text_candidates(value: str) -> list[str]:
-    candidates: list[str] = []
-    stripped = value.strip()
-    if stripped:
-        if "@" in stripped:
-            after_at = stripped.rsplit("@", 1)[-1].strip()
-            if after_at:
-                candidates.append(after_at)
-        candidates.append(stripped)
-    return candidates
+def build_match_variants(value: str) -> list[str]:
+    variants = {normalize_component(value), simplify_for_match(value)}
+    return sorted((variant for variant in variants if variant), key=len, reverse=True)
 
 
-def normalize_match(match: re.Match[str]) -> str:
-    prefix = match.group("prefix").upper()
-    number = match.group("number")
-    suffix = (match.group("suffix") or "").upper()
-
-    normalized = f"{prefix}-{number}"
-    if suffix in {"UC", "CH", "C"}:
-        normalized += "-C"
-    return normalized
+def strip_first_case_insensitive(text: str, token: str) -> str:
+    pattern = re.compile(re.escape(token), re.IGNORECASE)
+    return pattern.sub(" ", text, count=1)
 
 
-def extract_code(value: str) -> str | None:
-    for candidate in build_text_candidates(value):
-        matches = list(CODE_PATTERN.finditer(candidate))
-        if matches:
-            return normalize_match(matches[-1])
+def remove_folder_title(text: str, folder_title: str) -> str:
+    updated = text
+    for variant in build_match_variants(folder_title):
+        lowered_text = updated.lower()
+        lowered_variant = variant.lower()
+        if lowered_text.startswith(lowered_variant + " "):
+            updated = updated[len(variant) :]
+            break
+        if lowered_text == lowered_variant:
+            return ""
+        if lowered_variant in lowered_text:
+            updated = strip_first_case_insensitive(updated, variant)
+            break
+    return normalize_component(updated)
+
+
+def extract_season_hint(name: str) -> int | None:
+    for pattern in SEASON_HINT_PATTERNS:
+        match = pattern.search(name)
+        if match:
+            return int(match.group("season"))
     return None
 
 
-def choose_code(video_file: Path) -> tuple[str | None, str]:
-    file_code = extract_code(video_file.stem)
-    if file_code:
-        return file_code, "file"
-
-    folder_code = extract_code(video_file.parent.name)
-    if folder_code:
-        return folder_code, "folder"
-
-    return None, ""
+def parse_season_only_folder(name: str) -> int | None:
+    normalized_name = normalize_component(name)
+    for pattern in SEASON_ONLY_PATTERNS:
+        match = pattern.fullmatch(normalized_name)
+        if match:
+            return int(match.group("season"))
+    return None
 
 
-def build_file_plan(video_file: Path) -> RenamePlan:
-    normalized_code, source_kind = choose_code(video_file)
-    if normalized_code is None:
-        return RenamePlan(
-            kind="file",
-            source=video_file,
-            target=video_file,
-            status="SKIP",
-            detail="No code found in file name or parent folder name.",
-        )
-
-    target = video_file.with_name(f"{normalized_code}{video_file.suffix}")
-    if is_same_name(video_file, target):
-        return RenamePlan(
-            kind="file",
-            source=video_file,
-            target=target,
-            status="SKIP",
-            detail=f"Already normalized from {source_kind} name.",
-        )
-
-    return RenamePlan(
-        kind="file",
-        source=video_file,
-        target=target,
-        status="RENAME",
-        detail=f"Matched from {source_kind} name.",
-    )
+def strip_season_marker(name: str) -> str:
+    updated = normalize_component(name)
+    for pattern in SEASON_HINT_PATTERNS:
+        updated = pattern.sub(" ", updated)
+    return normalize_component(updated)
 
 
-def build_directory_plan(directory: Path) -> RenamePlan:
-    normalized_code = extract_code(directory.name)
-    if normalized_code is None:
-        return RenamePlan(
-            kind="folder",
-            source=directory,
-            target=directory,
-            status="SKIP",
-            detail="No code found in folder name.",
-        )
+def derive_show_context(directory: Path) -> tuple[str, int | None]:
+    folder_name = normalize_component(directory.name)
+    season_only = parse_season_only_folder(folder_name)
+    if season_only is not None:
+        parent_title = normalize_movie_folder_title(directory.parent.name)
+        return parent_title or folder_name, season_only
 
-    target = directory.with_name(normalized_code)
-    if is_same_name(directory, target):
-        return RenamePlan(
-            kind="folder",
-            source=directory,
-            target=target,
-            status="SKIP",
-            detail="Already normalized from folder name.",
-        )
+    season_hint = extract_season_hint(folder_name)
+    if season_hint is not None:
+        show_title = strip_season_marker(folder_name)
+        if show_title:
+            return normalize_movie_folder_title(show_title), season_hint
 
-    return RenamePlan(
-        kind="folder",
-        source=directory,
-        target=target,
-        status="RENAME",
-        detail="Matched from folder name.",
-    )
+    return normalize_movie_folder_title(directory.name), None
 
 
-def mark_conflicts(plans: list[RenamePlan]) -> list[RenamePlan]:
-    grouped: dict[str, list[RenamePlan]] = {}
-    moving_sources = {
-        str(plan.source).lower()
-        for plan in plans
-        if plan.status == "RENAME" and not is_same_name(plan.source, plan.target)
-    }
+def cleanup_episode_title(title: str, show_title: str) -> str:
+    # Remove show title first to keep the operation idempotent on repeated scans.
+    title = remove_folder_title(normalize_component(title), show_title)
+    title = re.sub(r"\[[^\]]+\]", " ", title)
+    title = TECHNICAL_TOKEN_PATTERN.sub(" ", title)
+    title = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", title)
+    title = normalize_component(title)
+    title = remove_folder_title(title, show_title)
+    return title
 
-    for plan in plans:
-        if is_same_name(plan.source, plan.target):
-            continue
-        grouped.setdefault(str(plan.target).lower(), []).append(plan)
 
-    updated: list[RenamePlan] = []
-    for plan in plans:
-        if is_same_name(plan.source, plan.target):
-            updated.append(plan)
+def normalize_movie_folder_title(folder_name: str) -> str:
+    name = normalize_component(folder_name)
+    match = YEAR_PATTERN.search(name)
+    if not match:
+        return name
+
+    title_part = name[: match.start()]
+    title_part = TITLE_TRAILING_TRIM_PATTERN.sub("", title_part)
+    title_part = TECHNICAL_TOKEN_PATTERN.sub(" ", title_part)
+    title_part = normalize_component(title_part)
+    if not title_part:
+        return name
+    return f"{title_part} ({match.group(1)})"
+
+
+def parse_episode_info(
+    file_stem: str,
+    show_title: str,
+    fallback_season: int | None,
+    allow_leading_number: bool,
+) -> EpisodeInfo | None:
+    raw_text = file_stem.replace("_", " ")
+    for pattern in EPISODE_PATTERNS:
+        match = pattern.search(raw_text)
+        if not match:
             continue
 
-        target_key = str(plan.target).lower()
-        target_taken = plan.target.exists() and target_key not in moving_sources
-        duplicate_target = len(grouped[target_key]) > 1
-        if target_taken or duplicate_target:
-            reason = "Target already exists." if target_taken else "Multiple files map to the same target."
-            updated.append(
-                RenamePlan(
-                    kind=plan.kind,
-                    source=plan.source,
-                    target=plan.target,
-                    status="CONFLICT",
-                    detail=reason,
-                )
+        season_group = match.groupdict().get("season")
+        season = int(season_group) if season_group else (fallback_season or 1)
+        episode = int(match.group("episode"))
+        title_hint = cleanup_episode_title(
+            raw_text[: match.start()] + " " + raw_text[match.end() :],
+            show_title,
+        )
+        return EpisodeInfo(season=season, episode=episode, title_hint=title_hint)
+
+    if allow_leading_number:
+        candidate = normalize_component(file_stem)
+        match = LEADING_EPISODE_PATTERN.match(candidate)
+        if match:
+            episode = int(match.group("episode"))
+            title_hint = cleanup_episode_title(candidate[match.end() :], show_title)
+            return EpisodeInfo(
+                season=fallback_season or 1,
+                episode=episode,
+                title_hint=title_hint,
             )
-            continue
 
-        updated.append(plan)
-
-    return updated
+    return None
 
 
-def execute_file_plans(plans: list[RenamePlan]) -> None:
+def detect_extra_type(file_stem: str) -> str | None:
+    for extra_name, pattern in EXTRA_PATTERNS:
+        if pattern.search(file_stem):
+            return extra_name
+    return None
+
+
+def looks_like_numbered_episode_batch(video_files: list[Path]) -> bool:
+    if len(video_files) < 2:
+        return False
+
+    numbered_files = sum(
+        1
+        for video_file in video_files
+        if LEADING_EPISODE_PATTERN.match(normalize_component(video_file.stem))
+    )
+    return numbered_files >= 2 and numbered_files >= len(video_files) / 2
+
+
+def derive_version_label(file_stem: str, folder_title: str, index: int) -> str:
+    label = normalize_component(file_stem)
+    label = remove_folder_title(label, folder_title)
+    label = normalize_component(label)
+    if not label:
+        return f"version {index}"
+    return label
+
+
+def ensure_unique_name(
+    filename: str,
+    used_targets: set[str],
+    reserved_names: set[str],
+) -> str:
+    candidate = filename
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    counter = 2
+    while candidate.lower() in used_targets or candidate.lower() in reserved_names:
+        candidate = f"{stem} ({counter}){suffix}"
+        counter += 1
+    return candidate
+
+
+def plan_tv_renames(directory: Path, video_files: list[Path]) -> list[RenamePlan]:
+    show_title, season_hint = derive_show_context(directory)
+    allow_leading_number = (
+        season_hint is not None
+        or parse_season_only_folder(directory.parent.name) is not None
+        or looks_like_numbered_episode_batch(video_files)
+    )
+
+    reserved_names = {
+        child.name.lower()
+        for child in directory.iterdir()
+        if child.is_file() and child not in video_files
+    }
+    used_targets: set[str] = set()
+    plans: list[RenamePlan] = []
+
+    for video_file in sorted(video_files, key=lambda path: path.name.lower()):
+        episode_info = parse_episode_info(
+            file_stem=video_file.stem,
+            show_title=show_title,
+            fallback_season=season_hint,
+            allow_leading_number=allow_leading_number,
+        )
+
+        if episode_info is None:
+            extra_type = detect_extra_type(video_file.stem)
+            if extra_type:
+                target_base = f"{show_title}-{extra_type}"
+            else:
+                target_base = f"{show_title} - {normalize_component(video_file.stem)}"
+        else:
+            target_base = f"{show_title} - S{episode_info.season:02d}E{episode_info.episode:02d}"
+            if episode_info.title_hint:
+                target_base += f" - {episode_info.title_hint}"
+
+        target_name = ensure_unique_name(
+            f"{target_base}{video_file.suffix.lower()}",
+            used_targets,
+            reserved_names,
+        )
+        used_targets.add(target_name.lower())
+        plans.append(RenamePlan(source=video_file, target=video_file.with_name(target_name)))
+
+    return plans
+
+
+def plan_movie_renames(directory: Path, video_files: list[Path]) -> list[RenamePlan]:
+    folder_title = normalize_movie_folder_title(directory.name)
+    reserved_names = {
+        child.name.lower()
+        for child in directory.iterdir()
+        if child.is_file() and child not in video_files
+    }
+    used_targets: set[str] = set()
+    plans: list[RenamePlan] = []
+
+    for index, video_file in enumerate(sorted(video_files, key=lambda path: path.name.lower()), start=1):
+        extra_type = detect_extra_type(video_file.stem)
+        if extra_type:
+            target_base = f"{folder_title}-{extra_type}"
+        elif len(video_files) == 1:
+            target_base = folder_title
+        else:
+            version_label = derive_version_label(video_file.stem, folder_title, index)
+            target_base = f"{folder_title} - {version_label}"
+
+        target_name = ensure_unique_name(
+            f"{target_base}{video_file.suffix.lower()}",
+            used_targets,
+            reserved_names,
+        )
+        used_targets.add(target_name.lower())
+        plans.append(RenamePlan(source=video_file, target=video_file.with_name(target_name)))
+
+    return plans
+
+
+def detect_mode(directory: Path, video_files: list[Path], selected_mode: str) -> str:
+    if selected_mode != "auto":
+        return selected_mode
+
+    show_title, season_hint = derive_show_context(directory)
+    allow_leading_number = season_hint is not None or looks_like_numbered_episode_batch(video_files)
+
+    for video_file in video_files:
+        if parse_episode_info(video_file.stem, show_title, season_hint, allow_leading_number):
+            return "tv"
+
+    if season_hint is not None and len(video_files) > 1:
+        return "tv"
+
+    return "movie"
+
+
+def iter_media_folders(root: Path, recursive: bool) -> Iterable[tuple[Path, list[Path]]]:
+    if recursive:
+        for current_root, dir_names, file_names in os.walk(root):
+            dir_names[:] = [
+                dir_name
+                for dir_name in dir_names
+                if dir_name.lower() not in SKIP_DIR_NAMES and not dir_name.startswith(".")
+            ]
+            current_path = Path(current_root)
+            video_files = [current_path / name for name in file_names if is_video_file(current_path / name)]
+            if video_files:
+                yield current_path, video_files
+        return
+
+    direct_targets = [root]
+    direct_targets.extend(
+        child for child in root.iterdir() if child.is_dir() and child.name.lower() not in SKIP_DIR_NAMES
+    )
+    for directory in direct_targets:
+        video_files = [child for child in directory.iterdir() if is_video_file(child)]
+        if video_files:
+            yield directory, video_files
+
+
+def execute_plans(plans: list[RenamePlan]) -> None:
     staged_moves: list[tuple[Path, Path, Path]] = []
     try:
         for plan in plans:
-            if is_same_name(plan.source, plan.target):
+            if plan.source == plan.target:
                 continue
-            temp_name = f".__rename_tmp__{uuid.uuid4().hex}{plan.source.suffix}"
+            temp_name = f".__tmm_tmp__{uuid.uuid4().hex}{plan.source.suffix.lower()}"
             temp_path = plan.source.with_name(temp_name)
             plan.source.rename(temp_path)
             staged_moves.append((temp_path, plan.source, plan.target))
@@ -340,145 +503,75 @@ def execute_file_plans(plans: list[RenamePlan]) -> None:
         raise
 
 
-def execute_directory_plans(plans: list[RenamePlan]) -> None:
-    for plan in sorted(plans, key=lambda item: len(item.source.parts), reverse=True):
-        if is_same_name(plan.source, plan.target):
-            continue
+def scan_library(root: Path, mode: str, recursive: bool) -> tuple[list[ScanItem], int]:
+    raw_plans: list[tuple[RenamePlan, str]] = []
+    processed_folders = 0
 
-        case_only_rename = (
-            plan.source.parent == plan.target.parent and plan.source.name.lower() == plan.target.name.lower()
+    for directory, video_files in iter_media_folders(root, recursive=recursive):
+        processed_folders += 1
+        active_mode = detect_mode(directory, video_files, mode)
+        plans = (
+            plan_tv_renames(directory, video_files)
+            if active_mode == "tv"
+            else plan_movie_renames(directory, video_files)
         )
-        if case_only_rename:
-            temp_path = plan.source.with_name(f".__rename_tmp__{uuid.uuid4().hex}")
-            plan.source.rename(temp_path)
-            temp_path.rename(plan.target)
+        for plan in plans:
+            raw_plans.append((plan, active_mode))
+
+    moving_source_keys = {
+        str(plan.source).lower() for plan, _ in raw_plans if plan.source != plan.target
+    }
+    target_counts: dict[str, int] = {}
+    for plan, _ in raw_plans:
+        if plan.source == plan.target:
             continue
+        target_counts[str(plan.target).lower()] = target_counts.get(str(plan.target).lower(), 0) + 1
 
-        plan.source.rename(plan.target)
-
-
-def scan_library(root: Path, recursive: bool) -> ScanResult:
-    video_files = iter_video_files(root, recursive=recursive)
-    directories = iter_candidate_directories(root, recursive=recursive)
-
-    file_plans = mark_conflicts([build_file_plan(video_file) for video_file in video_files])
-    directory_plans = mark_conflicts([build_directory_plan(directory) for directory in directories])
-    plans = sorted(file_plans + directory_plans, key=lambda plan: (plan.kind, str(plan.source).lower()))
-
-    rename_plans = [plan for plan in plans if plan.status == "RENAME"]
-    conflict_plans = [plan for plan in plans if plan.status == "CONFLICT"]
-    file_rename_plans = [plan for plan in file_plans if plan.status == "RENAME"]
-    directory_rename_plans = [plan for plan in directory_plans if plan.status == "RENAME"]
-
-    return ScanResult(
-        root=root,
-        recursive=recursive,
-        directories=directories,
-        video_files=video_files,
-        file_plans=file_plans,
-        directory_plans=directory_plans,
-        plans=plans,
-        rename_plans=rename_plans,
-        conflict_plans=conflict_plans,
-        file_rename_plans=file_rename_plans,
-        directory_rename_plans=directory_rename_plans,
-    )
-
-
-def print_scan_result(result: ScanResult) -> None:
-    for plan in result.plans:
-        label = f"{translate_plan_kind(plan.kind):<4}"
-        status = translate_plan_status(plan.status)
-        detail = translate_plan_detail(plan.detail)
-        if plan.status == "SKIP":
-            print(f"[{status:<8}] [{label}] {plan.source} :: {detail}")
-        elif plan.status == "CONFLICT":
-            print(f"[{status:<8}] [{label}] {plan.source} -> {plan.target} :: {detail}")
+    items: list[ScanItem] = []
+    for plan, active_mode in raw_plans:
+        if plan.source == plan.target:
+            items.append(ScanItem(plan.source, plan.target, active_mode, "SKIP", "已经是规范命名"))
+            continue
+        target_key = str(plan.target).lower()
+        target_taken = plan.target.exists() and target_key not in moving_source_keys
+        duplicate = target_counts.get(target_key, 0) > 1
+        if target_taken:
+            items.append(ScanItem(plan.source, plan.target, active_mode, "CONFLICT", "目标已存在"))
+        elif duplicate:
+            items.append(ScanItem(plan.source, plan.target, active_mode, "CONFLICT", "多个文件映射到同一目标"))
         else:
-            print(f"[{status:<8}] [{label}] {plan.source} -> {plan.target} :: {detail}")
+            items.append(ScanItem(plan.source, plan.target, active_mode, "RENAME", "待重命名"))
 
-    print()
-    print(f"已检查文件夹: {len(result.directories)}")
-    print(f"视频文件: {len(result.video_files)}")
-    print(f"待重命名文件夹: {len(result.directory_rename_plans)}")
-    print(f"待重命名文件: {len(result.file_rename_plans)}")
-    print(f"待处理总数: {len(result.rename_plans)}")
-    print(f"冲突: {len(result.conflict_plans)}")
+    return items, processed_folders
 
 
-def apply_scan_result(result: ScanResult) -> None:
-    execute_file_plans(result.file_rename_plans)
-    execute_directory_plans(result.directory_rename_plans)
-
-
-def translate_plan_status(status: str) -> str:
-    return {
-        "SKIP": "跳过",
-        "CONFLICT": "冲突",
-        "RENAME": "重命名",
-    }.get(status, status)
-
-
-def translate_plan_kind(kind: str) -> str:
-    return {
-        "file": "文件",
-        "folder": "文件夹",
-    }.get(kind, kind)
-
-
-def translate_plan_detail(detail: str) -> str:
-    return {
-        "No code found in file name or parent folder name.": "文件名和父文件夹名中都没有识别到编号。",
-        "Already normalized from file name.": "文件名已经是规范格式。",
-        "Already normalized from folder name.": "文件夹名已经是规范格式。",
-        "Matched from file name.": "从文件名中识别到编号。",
-        "Matched from folder name.": "从文件夹名中识别到编号。",
-        "No code found in folder name.": "文件夹名中没有识别到编号。",
-        "Target already exists.": "目标名称已存在。",
-        "Multiple files map to the same target.": "多个项目映射到了同一个目标名称。",
-    }.get(detail, detail)
-
-
-FILTER_CHOICES = ("全部", "仅待重命名", "仅冲突", "仅跳过")
-
-
-def plan_matches_filter(plan: RenamePlan, filter_choice: str) -> bool:
-    status = {
-        "仅待重命名": "RENAME",
-        "仅冲突": "CONFLICT",
-        "仅跳过": "SKIP",
-    }.get(filter_choice)
-    return True if status is None else plan.status == status
-
-
-def plan_tag_name(plan: RenamePlan) -> str:
-    return {
-        "RENAME": "rename",
-        "CONFLICT": "conflict",
-        "SKIP": "skip",
-    }.get(plan.status, "default")
-
-
-def create_gui_app(initial_root: Path | None = None):
+def launch_gui(initial_root: Path | None = None, initial_mode: str = "auto") -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    class RenameGuiApp:
+    filter_choices = ("全部", "仅待重命名", "仅冲突", "仅跳过")
+    mode_choices = ("auto", "movie", "tv")
+    status_labels = {"RENAME": "重命名", "SKIP": "跳过", "CONFLICT": "冲突"}
+    mode_labels = {"movie": "电影", "tv": "剧集", "auto": "自动"}
+    filter_to_status = {"仅待重命名": "RENAME", "仅冲突": "CONFLICT", "仅跳过": "SKIP"}
+
+    class App:
         def __init__(self, window: tk.Tk) -> None:
             self.window = window
-            self.current_result: ScanResult | None = None
+            self.items: list[ScanItem] = []
+            self.processed_folders = 0
+            self.current_root: Path | None = None
             self.path_var = tk.StringVar(value=str(initial_root) if initial_root else "")
             self.recursive_var = tk.BooleanVar(value=True)
-            self.filter_var = tk.StringVar(value=FILTER_CHOICES[0])
-            self.summary_var = tk.StringVar(value="请选择目录，然后点击“预览”。")
+            self.mode_var = tk.StringVar(value=initial_mode if initial_mode in mode_choices else "auto")
+            self.filter_var = tk.StringVar(value=filter_choices[0])
+            self.summary_var = tk.StringVar(value='请选择目录后点击"预览"。')
             self._build_widgets()
-            if initial_root is not None:
-                self.window.after(100, self.preview)
 
         def _build_widgets(self) -> None:
-            self.window.title("TMM 视频重命名")
-            self.window.geometry("1420x820")
-            self.window.minsize(1100, 620)
+            self.window.title("TinyMediaManager 视频重命名")
+            self.window.geometry("1280x780")
+            self.window.minsize(1000, 600)
 
             container = ttk.Frame(self.window, padding=12)
             container.pack(fill="both", expand=True)
@@ -486,39 +579,40 @@ def create_gui_app(initial_root: Path | None = None):
             container.rowconfigure(3, weight=1)
 
             ttk.Label(container, text="目录").grid(row=0, column=0, sticky="w", padx=(0, 8))
-            path_entry = ttk.Entry(container, textvariable=self.path_var)
-            path_entry.grid(row=0, column=1, sticky="ew")
-            path_entry.focus_set()
+            entry = ttk.Entry(container, textvariable=self.path_var)
+            entry.grid(row=0, column=1, sticky="ew")
+            entry.focus_set()
             ttk.Button(container, text="浏览...", command=self.browse).grid(row=0, column=2, padx=(8, 0))
 
             action_row = ttk.Frame(container)
             action_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
             ttk.Checkbutton(action_row, text="递归扫描", variable=self.recursive_var).pack(side="left")
+            ttk.Label(action_row, text="模式").pack(side="left", padx=(16, 4))
+            ttk.Combobox(
+                action_row,
+                textvariable=self.mode_var,
+                values=mode_choices,
+                state="readonly",
+                width=8,
+            ).pack(side="left")
             ttk.Button(action_row, text="预览", command=self.preview).pack(side="left", padx=(8, 0))
-            self.apply_button = ttk.Button(action_row, text="执行重命名", command=self.apply_changes)
+            self.apply_button = ttk.Button(
+                action_row, text="执行重命名", command=self.apply_changes, state="disabled"
+            )
             self.apply_button.pack(side="left", padx=(8, 0))
-            self.apply_button.configure(state="disabled")
             ttk.Label(action_row, text="筛选").pack(side="left", padx=(16, 4))
             filter_box = ttk.Combobox(
                 action_row,
                 textvariable=self.filter_var,
-                values=FILTER_CHOICES,
+                values=filter_choices,
                 state="readonly",
                 width=12,
             )
             filter_box.pack(side="left")
             filter_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_view())
-            ttk.Label(
-                action_row,
-                text="Windows 可双击 tmm_rename_videos_gui.pyw 启动；Linux 请用 python3 tmm_rename_videos.py --gui。",
-            ).pack(side="right")
 
             ttk.Label(container, textvariable=self.summary_var, anchor="w").grid(
-                row=2,
-                column=0,
-                columnspan=3,
-                sticky="ew",
-                pady=(12, 10),
+                row=2, column=0, columnspan=3, sticky="ew", pady=(12, 10)
             )
 
             tree_frame = ttk.Frame(container)
@@ -526,18 +620,17 @@ def create_gui_app(initial_root: Path | None = None):
             tree_frame.columnconfigure(0, weight=1)
             tree_frame.rowconfigure(0, weight=1)
 
-            columns = ("status", "kind", "source", "target", "detail")
+            columns = ("status", "mode", "source", "target", "detail")
             self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
-            self.tree.heading("status", text="状态")
-            self.tree.heading("kind", text="类型")
-            self.tree.heading("source", text="原路径")
-            self.tree.heading("target", text="目标路径")
-            self.tree.heading("detail", text="说明")
-            self.tree.column("status", width=90, anchor="center", stretch=False)
-            self.tree.column("kind", width=90, anchor="center", stretch=False)
-            self.tree.column("source", width=420, anchor="w")
-            self.tree.column("target", width=420, anchor="w")
-            self.tree.column("detail", width=300, anchor="w")
+            for column, label, width, anchor in (
+                ("status", "状态", 80, "center"),
+                ("mode", "类型", 80, "center"),
+                ("source", "原路径", 420, "w"),
+                ("target", "目标路径", 420, "w"),
+                ("detail", "说明", 220, "w"),
+            ):
+                self.tree.heading(column, text=label)
+                self.tree.column(column, width=width, anchor=anchor)
             self.tree.grid(row=0, column=0, sticky="nsew")
 
             vertical_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -552,175 +645,159 @@ def create_gui_app(initial_root: Path | None = None):
             self.window.bind("<Return>", lambda _event: self.preview())
 
         def browse(self) -> None:
-            selected = filedialog.askdirectory(initialdir=self.path_var.get() or None)
-            if selected:
-                self.path_var.set(selected)
+            chosen = filedialog.askdirectory(initialdir=self.path_var.get() or None)
+            if chosen:
+                self.path_var.set(chosen)
 
-        def format_path(self, path: Path, root: Path) -> str:
+        def _format_path(self, path: Path) -> str:
+            if self.current_root is None:
+                return str(path)
             try:
-                return str(path.relative_to(root))
+                return str(path.relative_to(self.current_root))
             except ValueError:
                 return str(path)
 
-        def set_apply_state(self, result: ScanResult) -> None:
-            if result.rename_plans and not result.conflict_plans:
-                self.apply_button.configure(state="normal")
-            else:
-                self.apply_button.configure(state="disabled")
+        def _resolve_root(self) -> Path:
+            raw_value = self.path_var.get().strip()
+            if not raw_value:
+                raise ValueError("请先选择目录。")
+            resolved = Path(raw_value).expanduser().resolve()
+            if not resolved.exists() or not resolved.is_dir():
+                raise FileNotFoundError(f"目录不存在或不是文件夹：{resolved}")
+            self.path_var.set(str(resolved))
+            return resolved
+
+        def preview(self) -> None:
+            try:
+                root = self._resolve_root()
+                items, processed = scan_library(
+                    root,
+                    self.mode_var.get(),
+                    recursive=self.recursive_var.get(),
+                )
+            except (FileNotFoundError, ValueError) as error:
+                messagebox.showerror("预览失败", str(error), parent=self.window)
+                return
+            except Exception as error:
+                messagebox.showerror("预览失败", str(error), parent=self.window)
+                return
+
+            self.items = items
+            self.processed_folders = processed
+            self.current_root = root
+            self.refresh_view()
 
         def refresh_view(self) -> None:
-            if self.current_result is not None:
-                self.render_result(self.current_result)
-
-        def render_result(self, result: ScanResult) -> None:
-            filtered_plans = [
-                plan for plan in result.plans if plan_matches_filter(plan, self.filter_var.get())
-            ]
             self.tree.delete(*self.tree.get_children())
-            for plan in filtered_plans:
-                source_text = self.format_path(plan.source, result.root)
-                target_text = self.format_path(plan.target, result.root)
+            wanted_status = filter_to_status.get(self.filter_var.get())
+            visible = 0
+            for item in self.items:
+                if wanted_status is not None and item.status != wanted_status:
+                    continue
+                visible += 1
                 self.tree.insert(
                     "",
                     "end",
                     values=(
-                        translate_plan_status(plan.status),
-                        translate_plan_kind(plan.kind),
-                        source_text,
-                        target_text,
-                        translate_plan_detail(plan.detail),
+                        status_labels.get(item.status, item.status),
+                        mode_labels.get(item.mode, item.mode),
+                        self._format_path(item.source),
+                        self._format_path(item.target),
+                        item.detail,
                     ),
-                    tags=(plan_tag_name(plan),),
+                    tags=(item.status.lower(),),
                 )
 
+            rename_count = sum(1 for item in self.items if item.status == "RENAME")
+            conflict_count = sum(1 for item in self.items if item.status == "CONFLICT")
+            skip_count = sum(1 for item in self.items if item.status == "SKIP")
             self.summary_var.set(
                 " | ".join(
                     [
-                        f"已检查文件夹: {len(result.directories)}",
-                        f"视频文件: {len(result.video_files)}",
-                        f"待重命名文件夹: {len(result.directory_rename_plans)}",
-                        f"待重命名文件: {len(result.file_rename_plans)}",
-                        f"冲突: {len(result.conflict_plans)}",
-                        f"当前显示: {len(filtered_plans)}",
-                        f"筛选: {self.filter_var.get()}",
+                        f"已扫描文件夹: {self.processed_folders}",
+                        f"视频: {len(self.items)}",
+                        f"待重命名: {rename_count}",
+                        f"冲突: {conflict_count}",
+                        f"跳过: {skip_count}",
+                        f"当前显示: {visible}",
                     ]
                 )
             )
-            self.set_apply_state(result)
-
-        def load_result(self) -> ScanResult:
-            raw_path = self.path_var.get().strip()
-            if not raw_path:
-                raise ValueError("请先选择目录。")
-
-            root_path = normalize_root(Path(raw_path))
-            self.path_var.set(str(root_path))
-            return scan_library(root_path, recursive=self.recursive_var.get())
-
-        def preview(self) -> None:
-            try:
-                result = self.load_result()
-            except (FileNotFoundError, ValueError) as error:
-                messagebox.showerror("预览失败", str(error), parent=self.window)
-                return
-            except Exception as error:
-                messagebox.showerror("预览失败", str(error), parent=self.window)
-                return
-
-            self.current_result = result
-            self.render_result(result)
+            self.apply_button.configure(
+                state="normal" if rename_count and not conflict_count else "disabled"
+            )
 
         def apply_changes(self) -> None:
-            try:
-                result = self.load_result()
-            except (FileNotFoundError, ValueError) as error:
-                messagebox.showerror("执行失败", str(error), parent=self.window)
+            rename_items = [item for item in self.items if item.status == "RENAME"]
+            conflict_items = [item for item in self.items if item.status == "CONFLICT"]
+            if conflict_items:
+                messagebox.showerror("无法执行", "存在冲突，请先解决后再执行。", parent=self.window)
                 return
-            except Exception as error:
-                messagebox.showerror("执行失败", str(error), parent=self.window)
-                return
-
-            self.current_result = result
-            self.render_result(result)
-
-            if result.conflict_plans:
-                messagebox.showerror(
-                    "无法执行",
-                    "预览结果中存在冲突，请先处理后再执行。",
-                    parent=self.window,
-                )
-                return
-
-            if not result.rename_plans:
+            if not rename_items:
                 messagebox.showinfo("无需处理", "没有需要重命名的项目。", parent=self.window)
                 return
-
-            confirmed = messagebox.askyesno(
-                "确认执行",
-                f"确定执行 {len(result.rename_plans)} 个重命名操作吗？",
-                parent=self.window,
-            )
-            if not confirmed:
+            if not messagebox.askyesno(
+                "确认", f"确定执行 {len(rename_items)} 个重命名操作吗？", parent=self.window
+            ):
                 return
 
             try:
-                apply_scan_result(result)
-                refreshed = scan_library(result.root, recursive=result.recursive)
+                execute_plans([RenamePlan(source=item.source, target=item.target) for item in rename_items])
             except Exception as error:
                 messagebox.showerror("执行失败", str(error), parent=self.window)
                 return
 
-            self.current_result = refreshed
-            self.render_result(refreshed)
-            messagebox.showinfo(
-                "完成",
-                f"已执行 {len(result.rename_plans)} 个重命名操作。",
-                parent=self.window,
-            )
+            messagebox.showinfo("完成", f"已执行 {len(rename_items)} 个重命名。", parent=self.window)
+            self.preview()
 
-    root_window = tk.Tk()
-    RenameGuiApp(root_window)
-    return root_window
-
-
-def launch_gui(initial_root: Path | None = None) -> int:
-    root_window = create_gui_app(initial_root)
-    root_window.mainloop()
+    window = tk.Tk()
+    App(window)
+    window.mainloop()
     return 0
 
 
 def run_cli(args: argparse.Namespace) -> int:
-    if args.root is None:
-        print("命令行模式下必须提供根目录。", file=sys.stderr)
+    root = args.root.expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        print(f"Root folder not found or not a directory: {root}", file=sys.stderr)
         return 1
 
-    try:
-        root = normalize_root(args.root)
-    except FileNotFoundError as error:
-        print(str(error), file=sys.stderr)
-        return 1
+    items, processed_folders = scan_library(root, args.mode, recursive=not args.no_recursive)
 
-    result = scan_library(root, recursive=not args.no_recursive)
-    print_scan_result(result)
+    for item in items:
+        if item.status == "SKIP":
+            print(f"[SKIP    ] {item.source}")
+        elif item.status == "CONFLICT":
+            print(f"[CONFLICT] {item.source} -> {item.target} :: {item.detail}")
+        else:
+            print(f"[RENAME  ] {item.source} -> {item.target}")
+
+    rename_items = [item for item in items if item.status == "RENAME"]
+    conflict_items = [item for item in items if item.status == "CONFLICT"]
+    print()
+    print(f"Scanned folders: {processed_folders}")
+    print(f"Video files: {len(items)}")
+    print(f"Renames needed: {len(rename_items)}")
+    print(f"Conflicts: {len(conflict_items)}")
 
     if not args.apply:
-        print("当前仅为预览模式；加上 --apply 才会真正执行重命名。")
+        print("Dry-run only. Add --apply to rename files.")
         return 0
 
-    if result.conflict_plans:
-        print("检测到冲突，请先处理冲突后再重新执行。", file=sys.stderr)
+    if conflict_items:
+        print("Conflicts detected; aborting. Resolve them and try again.", file=sys.stderr)
         return 1
 
-    apply_scan_result(result)
-    print(f"已执行重命名: {len(result.rename_plans)}")
+    execute_plans([RenamePlan(source=item.source, target=item.target) for item in rename_items])
+    print(f"Applied renames: {len(rename_items)}")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.gui or args.root is None:
-        initial_root = None if args.root is None else args.root.expanduser()
-        return launch_gui(initial_root)
+        initial_root = args.root.expanduser() if args.root is not None else None
+        return launch_gui(initial_root, initial_mode=args.mode)
     return run_cli(args)
 
 
