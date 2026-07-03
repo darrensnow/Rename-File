@@ -61,16 +61,18 @@ SKIP_DIR_NAMES = {
     "samples",
 }
 
+SEASON_NUMBER_PATTERN = "(?:\\d{1,2}|[\u96f6\u3007\u4e00\u4e8c\u4e24\u5169\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{1,3})"
+
 SEASON_ONLY_PATTERNS = [
     re.compile(r"(?i)^season[ ._-]*(?P<season>\d{1,2})$"),
     re.compile(r"(?i)^s(?P<season>\d{1,2})$"),
-    re.compile(r"^第\s*(?P<season>\d{1,2})\s*季$"),
+    re.compile(f"^\u7b2c\\s*(?P<season>{SEASON_NUMBER_PATTERN})\\s*\u5b63$"),
 ]
 
 SEASON_HINT_PATTERNS = [
     re.compile(r"(?i)\bseason[ ._-]*(?P<season>\d{1,2})\b"),
     re.compile(r"(?i)\bs(?P<season>\d{1,2})\b"),
-    re.compile(r"第\s*(?P<season>\d{1,2})\s*季"),
+    re.compile(f"\u7b2c\\s*(?P<season>{SEASON_NUMBER_PATTERN})\\s*\u5b63"),
 ]
 
 EPISODE_PATTERNS = [
@@ -87,7 +89,7 @@ TECHNICAL_TOKEN_PATTERN = re.compile(
     r"(?i)\b("
     r"480p|576p|720p|1080p|1440p|2160p|4k|8k|"
     r"x264|x265|h[\s._-]?26[45]|hevc|av1|"
-    r"aac|ac3|eac3|dts(?:[\s._-]?hd)?|truehd|atmos|flac|fla|"
+    r"aac|ac3|eac3|dd|dts(?:[\s._-]?hd)?|truehd|atmos|flac|fla|"
     r"web[\s._-]*dl|webrip|web|bluray|bdrip|brrip|remux|dvdrip|"
     r"hdr(?:10)?|dolby[\s._-]?vision|dv|proper|repack|10bit|8bit|"
     r"amzn|nf|dsnp|hmax|ddp(?:[\s._-]?\d(?:\.\d)?)?|"
@@ -95,6 +97,8 @@ TECHNICAL_TOKEN_PATTERN = re.compile(
     r")\b"
 )
 
+
+CHANNEL_TOKEN_PATTERN = re.compile(r"(?i)\b(?:[257]\s*[._-]?\s*1|2\s*[._-]?\s*0)\b")
 EXTRA_PATTERNS = [
     ("behindthescenes", re.compile(r"(?i)behind[ ._-]*the[ ._-]*scenes")),
     ("deleted", re.compile(r"(?i)deleted[ ._-]*scenes?")),
@@ -220,11 +224,59 @@ def remove_folder_title(text: str, folder_title: str) -> str:
     return normalize_component(updated)
 
 
+CHINESE_DIGITS = {
+    "\u96f6": 0,
+    "\u3007": 0,
+    "\u4e00": 1,
+    "\u4e8c": 2,
+    "\u4e24": 2,
+    "\u5169": 2,
+    "\u4e09": 3,
+    "\u56db": 4,
+    "\u4e94": 5,
+    "\u516d": 6,
+    "\u4e03": 7,
+    "\u516b": 8,
+    "\u4e5d": 9,
+}
+
+
+def parse_chinese_number(value: str) -> int | None:
+    value = value.strip()
+    if not value:
+        return None
+    ten = "\u5341"
+    if any(char != ten and char not in CHINESE_DIGITS for char in value):
+        return None
+    if ten not in value:
+        if len(value) == 1:
+            return CHINESE_DIGITS.get(value)
+        return None
+    if value.count(ten) != 1:
+        return None
+
+    tens_text, ones_text = value.split(ten, 1)
+    tens = 1 if not tens_text else CHINESE_DIGITS.get(tens_text)
+    ones = 0 if not ones_text else CHINESE_DIGITS.get(ones_text)
+    if tens is None or ones is None:
+        return None
+    return tens * 10 + ones
+
+
+def parse_number_token(value: str) -> int | None:
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    return parse_chinese_number(value)
+
+
 def extract_season_hint(name: str) -> int | None:
     for pattern in SEASON_HINT_PATTERNS:
         match = pattern.search(name)
         if match:
-            return int(match.group("season"))
+            season = parse_number_token(match.group("season"))
+            if season is not None:
+                return season
     return None
 
 
@@ -233,7 +285,9 @@ def parse_season_only_folder(name: str) -> int | None:
     for pattern in SEASON_ONLY_PATTERNS:
         match = pattern.fullmatch(normalized_name)
         if match:
-            return int(match.group("season"))
+            season = parse_number_token(match.group("season"))
+            if season is not None:
+                return season
     return None
 
 
@@ -244,18 +298,44 @@ def strip_season_marker(name: str) -> str:
     return normalize_component(updated)
 
 
+def cleanup_season_folder_title(name: str) -> str:
+    title = strip_season_marker(name)
+    title = TECHNICAL_TOKEN_PATTERN.sub(" ", title)
+    title = CHANNEL_TOKEN_PATTERN.sub(" ", title)
+    return normalize_component(title)
+
+def season_marker_starts_name(name: str) -> bool:
+    normalized_name = normalize_component(name)
+    for pattern in SEASON_HINT_PATTERNS:
+        match = pattern.search(normalized_name)
+        if match and match.start() == 0:
+            return True
+    return False
+
+
+def remove_year_from_title(title: str) -> str:
+    title = normalize_component(title)
+    title = re.sub(r"[\s._-]*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]][\s._-]*", " ", title)
+    title = YEAR_PATTERN.sub(" ", title)
+    return normalize_component(title)
+
 def derive_show_context(directory: Path) -> tuple[str, int | None]:
     folder_name = normalize_component(directory.name)
     season_only = parse_season_only_folder(folder_name)
     if season_only is not None:
-        parent_title = normalize_movie_folder_title(directory.parent.name)
+        parent_title = remove_year_from_title(directory.parent.name)
         return parent_title or folder_name, season_only
 
     season_hint = extract_season_hint(folder_name)
     if season_hint is not None:
-        show_title = strip_season_marker(folder_name)
+        if season_marker_starts_name(folder_name):
+            parent_title = remove_year_from_title(directory.parent.name)
+            return parent_title or folder_name, season_hint
+        show_title = cleanup_season_folder_title(folder_name)
         if show_title:
-            return normalize_movie_folder_title(show_title), season_hint
+            return remove_year_from_title(show_title), season_hint
+        parent_title = remove_year_from_title(directory.parent.name)
+        return parent_title or folder_name, season_hint
 
     return normalize_movie_folder_title(directory.name), None
 
